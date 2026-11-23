@@ -1,14 +1,23 @@
 <!doctype html>
+<!-- Token Radar's page shell, radar-2. The board itself is rendered into #board by
+     dashboard/app.js from window.RADAR, the dataset main.ts writes beside this page as
+     data.js. No framework, no fetch and no network: every byte the page shows is local. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="description" content="Token Radar ranks pre-token protocols by implied launch value, with a farm plan for each — a static dashboard with no network.">
+<meta name="theme-color" content="#f2f5f3">
 <title>Token Radar: pre-token protocols ranked by implied value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <a class="skip" href="#board">Skip to the board</a>
-<main id="board" tabindex="-1" aria-busy="true"></main>
+<main id="board" tabindex="-1" aria-busy="true" aria-label="Token launch radar board"></main>
+<noscript>
+<p class="noscript-note">Token Radar needs JavaScript: the board is rendered in the page from its own dataset, with no network.</p>
+</noscript>
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>

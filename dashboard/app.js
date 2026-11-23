@@ -1,7 +1,8 @@
-// Token Radar's plain dashboard, radar-2. It reads window.RADAR (written beside dashboard/ by
-// main.ts) and renders the ranked board, a filterable table, a per-protocol detail drawer with the
-// model's own inputs and the protocol's farm plan, and a model sandbox that recomputes implied
-// values live. No network: every byte it shows is in data.js.
+// Token Radar's plain dashboard, radar-2. It reads window.RADAR (written beside
+// dashboard/ by main.ts as data.js) and renders the ranked board, a filterable table, a
+// per-protocol detail drawer with the model's own inputs and the protocol's farm plan,
+// and a model sandbox that recomputes implied values live. No network: every byte it
+// shows is in data.js. Press / anywhere to jump to the search box.
 (function () {
   'use strict';
 
@@ -14,19 +15,23 @@
     sandbox: { base: DATA.model.base_multiple, high: DATA.model.category_multiple_high }
   };
 
+  // The capital-efficient categories, mirrored from lib/model.ts: the page recomputes
+  // with the same set, so a row's category multiple is the board's own number.
   var CAPITAL_EFFICIENT = {
     'Lending': 1, 'Uncollateralized Lending': 1, 'CDP': 1, 'CDP Manager': 1,
     'Collateral Management': 1, 'Collateral Markets': 1, 'Derivatives': 1,
     'Interest Rate Derivatives': 1, 'Options': 1, 'RWA': 1, 'Basis Trading': 1
   };
 
-  var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+  // ---- Formatting: money, growth, age ----
+
+  var currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     if (Math.abs(n) >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
     if (Math.abs(n) >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
     if (Math.abs(n) >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
-    return usd.format(n);
+    return currency.format(n);
   }
   function fmtPct(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
@@ -38,9 +43,18 @@
     return Math.max(0, Math.round(days)) + 'd';
   }
 
-  // The model in one function: the page recomputes a row from the snapshot figures and checks the
-  // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  // The sandbox overrides the two multiples; at their defaults the recompute equals the board.
+  // The chains a protocol names, as one short label: the first two, or a neutral phrase.
+  function chainLabel(p) {
+    var chains = p.chains || [];
+    return chains.length ? chains.slice(0, 2).join(', ') : 'an unnamed chain';
+  }
+
+  // ---- The model, in the page: the same arithmetic as lib/model.ts ----
+
+  // The model in one function: the page recomputes a row from the snapshot figures and
+  // checks the number board.json carries, so the page's code and the board's data are
+  // visibly the same arithmetic. The sandbox overrides the two multiples; at their
+  // defaults the recompute equals the board.
   function impliedOf(row, model, sandbox) {
     var catMult = CAPITAL_EFFICIENT[row.category || ''] ? (sandbox ? sandbox.high : row.category_multiple) : (sandbox ? sandbox.base : model.base_multiple);
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
@@ -61,6 +75,8 @@
   function shownImplied(row) {
     return sandboxChanged() ? impliedOf(row, DATA.model, state.sandbox) : row.implied_value_usd;
   }
+
+  // ---- A tiny element builder: el('div', {class, text, onclick}, ...children) ----
 
   function el(tag, attrs) {
     var node = document.createElement(tag);
@@ -83,8 +99,11 @@
     return node;
   }
 
-  // The farm plan is the same derivation main.ts writes to board.json: category, chains, TVL and age
-  // decide the action, the capital, the hold and every cost and time. No name is special-cased.
+  // ---- The farm plan, derived in the page exactly as main.ts derives it ----
+
+  // The farm plan is the same derivation main.ts writes to board.json: category, chains,
+  // TVL and age decide the action, the capital, the hold and every cost and time. No
+  // name is special-cased, so the drawer and the board can never disagree.
   function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
   function capitalFor(p) {
     if (p.tvl_usd >= 5e9) return 250;
@@ -150,6 +169,8 @@
     ].map(stepText);
   }
 
+  // ---- State in the URL hash: search, filters, watchlist, open protocol ----
+
   function readHash() {
     var hash = window.location.hash.replace(/^#/, '');
     if (!hash) return;
@@ -172,6 +193,8 @@
     else window.history.replaceState(null, '', window.location.pathname + window.location.search);
   }
 
+  // ---- Filtering and sorting the board ----
+
   function rows() {
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
@@ -183,20 +206,27 @@
       return hay.indexOf(q) >= 0;
     });
   }
+  // One row's value under the active sort key: the sandbox's implied value, the name,
+  // the TVL, the 7-day change, or the age (an unknown age sorts last, as the oldest).
+  function rowValue(row, key) {
+    if (key === 'name') return row.name.toLowerCase();
+    if (key === 'tvl') return row.tvl_usd;
+    if (key === 'growth') return row.change_7d === null ? -Infinity : row.change_7d;
+    if (key === 'age') return row.age_days === null ? Infinity : row.age_days;
+    return shownImplied(row);
+  }
   function sortedRows(list) {
     var key = state.sort;
     return list.slice().sort(function (a, b) {
-      var av, bv;
-      if (key === 'name') { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
-      else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
-      else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
-      else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
-      else { av = shownImplied(a); bv = shownImplied(b); }
+      var av = rowValue(a, key);
+      var bv = rowValue(b, key);
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
       return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
     });
   }
+
+  // ---- Header, lede, controls ----
 
   function header() {
     return el('header', { class: 'top' },
@@ -263,6 +293,8 @@
     );
   }
 
+  // ---- The board table, the live table, the model panel ----
+
   function boardTable() {
     var list = sortedRows(rows());
     if (list.length === 0) {
@@ -288,7 +320,7 @@
         el('td', { class: 'num', text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
           el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
+          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + chainLabel(r) })
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
@@ -325,7 +357,7 @@
     DATA.live.forEach(function (r) {
       tbody.appendChild(el('tr', null,
         el('td', { class: 'num', text: 'live' }),
-        el('td', null, el('div', { class: 'name' }, el('b', { text: r.name }), el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') }))),
+        el('td', null, el('div', { class: 'name' }, el('b', { text: r.name }), el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + chainLabel(r) }))),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + (r.change_7d !== null && r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) }),
         el('td', { class: 'num', text: fmtUsd(r.mcap_usd) }),
@@ -371,6 +403,8 @@
       )
     );
   }
+
+  // ---- The detail drawer: model breakdown and farm plan for one protocol ----
 
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
@@ -421,6 +455,8 @@
     }
   }
 
+  // ---- Render, and the keyboard: / focuses the search, Escape closes the drawer ----
+
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
@@ -439,5 +475,10 @@
   render();
   window.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && dialog.open) dialog.close();
+    if (e.key === '/' && document.activeElement !== document.getElementById('q')) {
+      e.preventDefault();
+      var box = document.getElementById('q');
+      if (box) box.focus();
+    }
   });
 })();
