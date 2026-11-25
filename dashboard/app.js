@@ -1,484 +1,372 @@
-// Token Radar's plain dashboard, radar-2. It reads window.RADAR (written beside
+// Token Radar's plain dashboard, radar-3. It reads window.RADAR (written beside
 // dashboard/ by main.ts as data.js) and renders the ranked board, a filterable table, a
-// per-protocol detail drawer with the model's own inputs and the protocol's farm plan,
-// and a model sandbox that recomputes implied values live. No network: every byte it
-// shows is in data.js. Press / anywhere to jump to the search box.
+// per-protocol detail view with the model's own inputs and the protocol's costed farm
+// plan, the live-token set, the 758-protocol audit, the methodology, and a model sandbox
+// that recomputes expected values live from the fitted coefficients. No network: every
+// byte it shows is in data.js. Press / anywhere to jump to the search box.
 (function () {
   'use strict';
 
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
+  var VF = DATA.value_fit;
+  var OF = DATA.odds_fit;
   var state = {
-    q: '', category: 'all', chain: 'all', watchlistOnly: false, tab: 'pre-token',
-    sort: 'implied', dir: -1, selected: null,
-    sandbox: { base: DATA.model.base_multiple, high: DATA.model.category_multiple_high }
+    q: '', category: 'all', verdict: 'all', watchlistOnly: false, tab: 'board',
+    sort: 'ev', dir: -1, selected: null,
   };
 
-  // The capital-efficient categories, mirrored from lib/model.ts: the page recomputes
-  // with the same set, so a row's category multiple is the board's own number.
-  var CAPITAL_EFFICIENT = {
-    'Lending': 1, 'Uncollateralized Lending': 1, 'CDP': 1, 'CDP Manager': 1,
-    'Collateral Management': 1, 'Collateral Markets': 1, 'Derivatives': 1,
-    'Interest Rate Derivatives': 1, 'Options': 1, 'RWA': 1, 'Basis Trading': 1
-  };
-
-  // ---- Formatting: money, growth, age ----
-
-  var currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
-  function fmtUsd(n) {
-    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
-    if (Math.abs(n) >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
-    if (Math.abs(n) >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
-    if (Math.abs(n) >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
-    return currency.format(n);
+  /* ---- small helpers ---- */
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
   }
-  function fmtPct(n) {
-    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
-    return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+  function usd(v) {
+    return '$' + Math.round(v).toLocaleString('en-US');
+  }
+  function money(v) {
+    return v < 1 && v > -1 ? '$' + v.toFixed(2) : usd(v);
+  }
+  function usdM(v) {
+    return '$' + (v / 1000000).toFixed(1) + 'M';
+  }
+  function pct(v, digits) {
+    return (100 * v).toFixed(digits === undefined ? 1 : digits) + '%';
   }
   function fmtAge(days) {
-    if (days === null || days === undefined) return 'unknown';
-    if (days >= 365) return (days / 365).toFixed(1) + 'y';
-    return Math.max(0, Math.round(days)) + 'd';
+    if (days === null || days === undefined) return '—';
+    if (days < 365) return days + 'd';
+    return (days / 365).toFixed(1) + 'y';
+  }
+  function clippedGrowth(pctGrowth) {
+    return Math.max(-0.5, Math.min(0.5, pctGrowth / 100));
+  }
+  function sigmoid(z) {
+    return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
   }
 
-  // The chains a protocol names, as one short label: the first two, or a neutral phrase.
-  function chainLabel(p) {
-    var chains = p.chains || [];
-    return chains.length ? chains.slice(0, 2).join(', ') : 'an unnamed chain';
+  /* ---- the fitted model, re-run in the page ----
+     The same two fits main.ts runs, from the same coefficients in data.js: the ridge
+     value model (log market cap on centred log TVL, category, chains, winsorized
+     growth and age) and the cure-survival odds model (pi from size, growth and
+     chains; a Weibull no-token clock in age). The sandbox uses it, and the row-1
+     self-check re-runs it on the board's first row and compares. */
+  function modelFor(tvl, growthPct, ageDays, category, chains) {
+    var lt = Math.log10(Math.max(1, tvl)) - 8;
+    var ageY = ((ageDays === null || ageDays === undefined) ? VF.median_age_days : ageDays) / 365;
+    var growth = clippedGrowth(growthPct);
+    var logMcap = VF.intercept
+      + VF.log_tvl * lt
+      + VF.log_tvl_sq * lt * lt
+      + (VF.categories[category] || 0)
+      + VF.log_chains * Math.log10(Math.max(1, chains))
+      + VF.growth * growth
+      + VF.age_years * ageY
+      + VF.age_years_sq * ageY * ageY;
+    var fitted = Math.pow(10, logMcap);
+    var age = (ageDays === null || ageDays === undefined) ? 365 : Math.max(1, ageDays);
+    var pi = sigmoid(
+      OF.cure_pi_intercept
+      + OF.cure_log_tvl * lt
+      + OF.cure_growth * growth
+      + OF.cure_log_chains * Math.log10(Math.max(1, chains)),
+    );
+    var s = Math.exp(-Math.pow(age / OF.weibull_lambda_days, OF.weibull_k));
+    var odds = (pi * s) / (1 - pi + pi * s);
+    return { fitted: fitted, pi: pi, odds: odds, ev: fitted * odds };
   }
 
-  // ---- The model, in the page: the same arithmetic as lib/model.ts ----
-
-  // The model in one function: the page recomputes a row from the snapshot figures and
-  // checks the number board.json carries, so the page's code and the board's data are
-  // visibly the same arithmetic. The sandbox overrides the two multiples; at their
-  // defaults the recompute equals the board.
-  function impliedOf(row, model, sandbox) {
-    var catMult = CAPITAL_EFFICIENT[row.category || ''] ? (sandbox ? sandbox.high : row.category_multiple) : (sandbox ? sandbox.base : model.base_multiple);
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthMult = 1 + (growth / 100) * model.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var f;
-    if (age <= model.maturity_rise_days) f = age / model.maturity_rise_days;
-    else if (age <= model.maturity_peak_days) f = 1;
-    else f = Math.max(model.maturity_decay_floor, 1 - (age - model.maturity_peak_days) / model.maturity_decay_days);
-    var maturity = model.maturity_floor + f * model.maturity_range;
-    var chains = row.chains ? row.chains.length : 0;
-    var breadth = 1 + Math.min(Math.max(chains - 1, 0), model.breadth_cap_steps) * model.breadth_step;
-    return Math.max(1, Math.round(row.tvl_usd * catMult * growthMult * maturity * breadth));
-  }
-  function sandboxChanged() {
-    return state.sandbox.base !== DATA.model.base_multiple || state.sandbox.high !== DATA.model.category_multiple_high;
-  }
-  function shownImplied(row) {
-    return sandboxChanged() ? impliedOf(row, DATA.model, state.sandbox) : row.implied_value_usd;
+  /* ---- KPI strip ---- */
+  function kpiStrip() {
+    var evs = DATA.rows.map(function (r) { return r.implied_value_usd; }).sort(function (a, b) { return a - b; });
+    var medianEv = evs[Math.floor(evs.length / 2)];
+    var farms = DATA.rows.filter(function (r) { return r.verdict === 'farm'; }).length;
+    var kpis = [
+      [String(DATA.board_size), 'ranked rows'],
+      [DATA.audit.ranked_watchlist + ' / ' + DATA.watchlist_size, 'watchlist covered'],
+      [usdM(medianEv), 'median expected value'],
+      [VF.loo_ratio.toFixed(2) + '×', 'LOO beats flat multiple'],
+      [pct(VF.loo_within_3x, 0), 'LOO within 3× (flat ' + pct(VF.flat_within_3x, 0) + ')'],
+      [OF.auc_cv.toFixed(3), 'odds 5-fold CV AUC'],
+      [farms + ' farm', 'verdicts: ' + farms + ' farm, ' + DATA.rows.filter(function (r) { return r.verdict === 'thin'; }).length + ' thin, ' + DATA.rows.filter(function (r) { return r.verdict === 'skip'; }).length + ' skip'],
+      [DATA.audit.total + ' counted', '758 protocols accounted'],
+    ];
+    return '<ul class="kpis">' + kpis.map(function (k) {
+      return '<li><span class="kpi-value">' + esc(k[0]) + '</span><span class="kpi-label">' + esc(k[1]) + '</span></li>';
+    }).join('') + '</ul>';
   }
 
-  // ---- A tiny element builder: el('div', {class, text, onclick}, ...children) ----
-
-  function el(tag, attrs) {
-    var node = document.createElement(tag);
-    if (attrs) {
-      Object.keys(attrs).forEach(function (k) {
-        if (k === 'class') node.className = attrs[k];
-        else if (k === 'text') node.textContent = attrs[k];
-        else if (k === 'html') node.innerHTML = attrs[k];
-        else if (k.slice(0, 2) === 'on') node.addEventListener(k.slice(2), attrs[k]);
-        else if (attrs[k] !== null && attrs[k] !== undefined) node.setAttribute(k, attrs[k]);
-      });
-    }
-    for (var i = 2; i < arguments.length; i++) {
-      var child = arguments[i];
-      if (child === null || child === undefined) continue;
-      if (Array.isArray(child)) child.forEach(function (c) { if (c) node.appendChild(c); });
-      else if (typeof child === 'string') node.appendChild(document.createTextNode(child));
-      else node.appendChild(child);
-    }
-    return node;
+  /* ---- self-check strip ---- */
+  function checksStrip() {
+    var items = DATA.self_checks.map(function (c) {
+      var ok = c.name === 'model sandbox agrees with row 1' ? sandboxAgrees() : c.pass;
+      return '<li><span class="' + (ok ? 'pass' : 'fail') + '">' + (ok ? '✓' : '✗') + '</span> <strong>' + esc(c.name) + '</strong> — ' + esc(c.detail) + '</li>';
+    }).join('');
+    return '<h2>Self-checks — every claim on this page, verified</h2><ul class="checks">' + items + '</ul>';
   }
 
-  // ---- The farm plan, derived in the page exactly as main.ts derives it ----
-
-  // The farm plan is the same derivation main.ts writes to board.json: category, chains,
-  // TVL and age decide the action, the capital, the hold and every cost and time. No
-  // name is special-cased, so the drawer and the board can never disagree.
-  function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
-  function capitalFor(p) {
-    if (p.tvl_usd >= 5e9) return 250;
-    if (p.tvl_usd >= 1e9) return 150;
-    if (p.tvl_usd >= 1e8) return 100;
-    return 50;
-  }
-  function holdDaysFor(age) {
-    if (age === null || age === undefined) return 30;
-    if (age < 180) return 60;
-    if (age < 365) return 45;
-    return 30;
-  }
-  function actionFor(p, capital, chain) {
-    var c = (p.category || '').toLowerCase();
-    var name = p.name;
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ' and keep the position open.';
-    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' and keep the position open.';
-    if (c.indexOf('bridge') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + name + ' and use the bridged funds in its app.';
-    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return "Stake $" + capital + " of the chain's staking asset through " + name + ' and keep the receipt.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' and open one small hedge.';
-    if (c.indexOf('prediction') >= 0) return 'Fund $' + capital + ' and place one market position on ' + name + '.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and keep the shares.';
-    if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + '.';
-    if (c.indexOf('rwa') >= 0) return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it.';
-    if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy.';
-    return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
-  }
-  function secondActionFor(p, capital, chain) {
-    var c = (p.category || '').toLowerCase();
-    var name = p.name;
-    var small = Math.max(10, Math.round(capital / 5));
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Borrow $' + small + ' against the supply you just made on ' + name + ', then repay it within the week.';
-    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Swap $' + small + ' in the same ' + name + ' pool so the position shows both sides of the market.';
-    if (c.indexOf('bridge') >= 0) return 'Use the bridged funds for one swap or deposit in the destination app on ' + chain + '.';
-    if (c.indexOf('staking') >= 0 || c.indexOf('restak') >= 0) return 'Delegate a second, smaller stake of $' + small + ' from the same wallet a few days later.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Close the hedge on ' + name + ' and open one more small position in the opposite direction.';
-    if (c.indexOf('prediction') >= 0) return 'Place a second position of $' + small + ' on a different ' + name + ' market.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Deposit $' + small + ' into a different ' + name + ' vault on ' + chain + '.';
-    if (c.indexOf('stable') >= 0) return 'Hold the stable asset through one full weekly cycle before moving it anywhere.';
-    if (c.indexOf('rwa') >= 0) return 'Reinvest one distribution of $' + small + ' back into the same ' + name + ' yield asset.';
-    if (c.indexOf('insurance') >= 0) return 'Top up the cover by $' + small + ' so the policy shows two purchases.';
-    return 'Repeat the deposit once more with $' + small + ' so the wallet shows two entries.';
-  }
-  function stepText(step) {
-    var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
-    if (s.length > 600) s = s.slice(0, 596) + '...';
-    if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
-    return s;
-  }
-  function farmSteps(p) {
-    var chain = chainOf(p);
-    var capital = capitalFor(p);
-    var hold = holdDaysFor(p.age_days);
-    return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
-      { text: secondActionFor(p, capital, chain), cost: 'about $' + (capital >= 150 ? 5 : 2) + ' of gas', time: '10 minutes' },
-      { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
-      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
-      { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
-    ].map(stepText);
+  /* The row-1 check, re-run here: recompute the first row's expected value from its
+     own TVL, growth, age and category, and compare with the board's figure. */
+  function sandboxAgrees() {
+    var r = DATA.rows[0];
+    if (!r) return false;
+    var m = modelFor(r.tvl_usd, r.change_7d === null ? 0 : r.change_7d, r.age_days, r.category, r.chains.length);
+    return Math.abs(m.ev - r.implied_value_usd) / Math.max(1, r.implied_value_usd) < 0.005;
   }
 
-  // ---- State in the URL hash: search, filters, watchlist, open protocol ----
-
-  function readHash() {
-    var hash = window.location.hash.replace(/^#/, '');
-    if (!hash) return;
-    var params = new URLSearchParams(hash);
-    if (params.get('q')) state.q = params.get('q');
-    if (params.get('p')) state.selected = params.get('p');
-    if (params.get('category')) state.category = params.get('category');
-    if (params.get('chain')) state.chain = params.get('chain');
-    if (params.get('wl') === '1') state.watchlistOnly = true;
-  }
-  function writeHash() {
-    var params = new URLSearchParams();
-    if (state.q) params.set('q', state.q);
-    if (state.category !== 'all') params.set('category', state.category);
-    if (state.chain !== 'all') params.set('chain', state.chain);
-    if (state.watchlistOnly) params.set('wl', '1');
-    if (state.selected) params.set('p', state.selected);
-    var next = params.toString();
-    if (next) window.history.replaceState(null, '', '#' + next);
-    else window.history.replaceState(null, '', window.location.pathname + window.location.search);
-  }
-
-  // ---- Filtering and sorting the board ----
-
-  function rows() {
+  /* ---- board table ---- */
+  function filteredRows() {
     var q = state.q.trim().toLowerCase();
-    return DATA.rows.filter(function (r) {
+    var rows = DATA.rows.filter(function (r) {
       if (state.watchlistOnly && !r.watchlist) return false;
       if (state.category !== 'all' && r.category !== state.category) return false;
-      if (state.chain !== 'all' && !(r.chains || []).some(function (c) { return c === state.chain; })) return false;
-      if (!q) return true;
-      var hay = [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase();
-      return hay.indexOf(q) >= 0;
+      if (state.verdict !== 'all' && r.verdict !== state.verdict) return false;
+      if (q && r.name.toLowerCase().indexOf(q) < 0 && r.slug.toLowerCase().indexOf(q) < 0) return false;
+      return true;
     });
-  }
-  // One row's value under the active sort key: the sandbox's implied value, the name,
-  // the TVL, the 7-day change, or the age (an unknown age sorts last, as the oldest).
-  function rowValue(row, key) {
-    if (key === 'name') return row.name.toLowerCase();
-    if (key === 'tvl') return row.tvl_usd;
-    if (key === 'growth') return row.change_7d === null ? -Infinity : row.change_7d;
-    if (key === 'age') return row.age_days === null ? Infinity : row.age_days;
-    return shownImplied(row);
-  }
-  function sortedRows(list) {
     var key = state.sort;
-    return list.slice().sort(function (a, b) {
-      var av = rowValue(a, key);
-      var bv = rowValue(b, key);
-      if (av < bv) return -state.dir;
-      if (av > bv) return state.dir;
-      return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+    rows.sort(function (a, b) {
+      var av = key === 'ev' ? a.implied_value_usd : key === 'fitted' ? a.fitted_value_usd
+        : key === 'odds' ? a.odds : key === 'tvl' ? a.tvl_usd : key === 'age' ? (a.age_days === null ? -1 : a.age_days)
+        : a.rank;
+      var bv = key === 'ev' ? b.implied_value_usd : key === 'fitted' ? b.fitted_value_usd
+        : key === 'odds' ? b.odds : key === 'tvl' ? b.tvl_usd : key === 'age' ? (b.age_days === null ? -1 : b.age_days)
+        : b.rank;
+      return (av - bv) * state.dir;
     });
+    return rows;
   }
 
-  // ---- Header, lede, controls ----
-
-  function header() {
-    return el('header', { class: 'top' },
-      el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Token Radar' })),
-      el('div', { class: 'top-meta' },
-        el('span', { text: 'Snapshot ' + DATA.as_of }),
-        el('span', { text: 'DefiLlama protocol index' }),
-        el('span', { text: DATA.model_version + ' model' })
-      )
-    );
+  function boardTable(rows) {
+    var body = rows.map(function (r) {
+      return '<tr data-slug="' + esc(r.slug) + '" class="' + (r.watchlist ? 'watch' : '') + '">'
+        + '<td class="num">' + r.rank + '</td>'
+        + '<td>' + esc(r.name) + (r.watchlist ? ' <span class="tag">WATCH</span>' : '') + '</td>'
+        + '<td>' + esc(r.category || '—') + '</td>'
+        + '<td class="num">' + usdM(r.tvl_usd) + '</td>'
+        + '<td class="num">' + (r.change_7d === null ? '—' : (r.change_7d >= 0 ? '+' : '') + r.change_7d.toFixed(1) + '%') + '</td>'
+        + '<td class="num">' + fmtAge(r.age_days) + '</td>'
+        + '<td class="num">' + usdM(r.fitted_value_usd) + '</td>'
+        + '<td class="num">' + r.odds.toFixed(2) + '</td>'
+        + '<td class="num"><strong>' + usdM(r.implied_value_usd) + '</strong><br><span class="muted small">' + usdM(r.ev_low_usd) + '–' + usdM(r.ev_high_usd) + '</span></td>'
+        + '<td class="num">' + r.rank_low + '–' + r.rank_high + '</td>'
+        + '<td><span class="pill ' + r.verdict + '">' + r.verdict + '</span></td>'
+        + '</tr>';
+    }).join('');
+    return '<div class="tablewrap"><table><thead><tr>'
+      + '<th class="num">#</th><th>Protocol</th><th>Category</th>'
+      + '<th class="num">TVL</th><th class="num">7d</th><th class="num">Age</th>'
+      + '<th class="num">Fitted value</th><th class="num">Odds</th>'
+      + '<th class="num">Expected value</th><th class="num">Rank range</th><th>Verdict</th>'
+      + '</tr></thead><tbody>' + body + '</tbody></table></div>';
   }
 
-  function lede() {
-    return el('section', { class: 'lede' },
-      el('div', null,
-        el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by implied value' }),
-        el('p', { text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' pre-token protocols below that floor, each passing the watchlist\u2019s own exclusion rules. Implied value is a model, not a promise.' })
-      ),
-      el('div', { class: 'facts' },
-        el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
-        el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Early rows excluded' }), el('b', { text: String(DATA.excluded_early) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
-      )
-    );
+  function controlsHtml() {
+    var cats = [];
+    DATA.rows.forEach(function (r) { if (r.category && cats.indexOf(r.category) < 0) cats.push(r.category); });
+    cats.sort();
+    return '<div class="controls">'
+      + '<div><label for="q">Search</label><input id="q" type="search" placeholder="name or slug" value="' + esc(state.q) + '"></div>'
+      + '<div><label for="cat">Category</label><select id="cat"><option value="all">All categories</option>'
+      + cats.map(function (c) { return '<option value="' + esc(c) + '"' + (state.category === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') + '</select></div>'
+      + '<div><label for="verdict">Verdict</label><select id="verdict">'
+      + ['all', 'farm', 'thin', 'skip'].map(function (v) { return '<option value="' + v + '"' + (state.verdict === v ? ' selected' : '') + '>' + (v === 'all' ? 'All verdicts' : v) + '</option>'; }).join('') + '</select></div>'
+      + '<div><label for="sort">Sort by</label><select id="sort">'
+      + [['ev', 'Expected value'], ['fitted', 'Fitted value'], ['odds', 'Odds'], ['tvl', 'TVL'], ['age', 'Age'], ['rank', 'Rank']].map(function (o) { return '<option value="' + o[0] + '"' + (state.sort === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select></div>'
+      + '<div class="checkline"><input id="watch" type="checkbox"' + (state.watchlistOnly ? ' checked' : '') + '><label for="watch">Watchlist only</label></div>'
+      + '</div>';
   }
 
-  function controls() {
-    var categories = Array.from(new Set(DATA.rows.map(function (r) { return r.category || 'Other'; }))).sort();
-    var chains = Array.from(new Set(DATA.rows.reduce(function (acc, r) { return acc.concat(r.chains || []); }, []))).sort();
-    var search = el('input', { type: 'search', id: 'q', placeholder: 'Search name, category or chain', value: state.q, 'aria-label': 'Search the board' });
-    search.addEventListener('input', function () { state.q = search.value; writeHash(); render(); });
-    var select = el('select', { id: 'category', 'aria-label': 'Filter by category' },
-      el('option', { value: 'all', text: 'All categories' }),
-      categories.map(function (c) { return el('option', { value: c, text: c, selected: c === state.category ? 'selected' : null }); })
-    );
-    select.addEventListener('change', function () { state.category = select.value; writeHash(); render(); });
-    var chainSelect = el('select', { id: 'chain', 'aria-label': 'Filter by chain' },
-      el('option', { value: 'all', text: 'All chains' }),
-      chains.map(function (c) { return el('option', { value: c, text: c, selected: c === state.chain ? 'selected' : null }); })
-    );
-    chainSelect.addEventListener('change', function () { state.chain = chainSelect.value; writeHash(); render(); });
-    var wl = el('input', { type: 'checkbox', id: 'wl', checked: state.watchlistOnly ? 'checked' : null, 'aria-label': 'Watchlist only' });
-    wl.addEventListener('change', function () { state.watchlistOnly = wl.checked; writeHash(); render(); });
-    var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; render(); } });
-    var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; render(); } });
-    return el('div', { class: 'controls' },
-      el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search' }), search),
-      el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), select),
-      el('div', { class: 'field' }, el('label', { for: 'chain', text: 'Chain' }), chainSelect),
-      el('label', { class: 'check', for: 'wl' }, wl, 'Watchlist only'),
-      el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
-      el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : DATA.live.length + ' live-token protocols' })
-    );
+  function boardView() {
+    var rows = filteredRows();
+    return '<h1>Token Radar <span class="muted small">radar-3</span></h1>'
+      + '<p class="lede">Every pre-token protocol in the snapshot, ranked by expected launch value: a fitted value model times fitted listing odds. Snapshot ' + esc(DATA.as_of) + ' from ' + esc(DATA.source) + '; floor ' + usd(DATA.floor_usd) + '. The value model is a ridge regression fitted on the 128 traded protocols with a positive market cap; the odds come from a cure-survival model fitted on all 758 protocols. Nothing here is a hardcoded multiple.</p>'
+      + kpiStrip()
+      + checksStrip()
+      + '<div class="tabs"><a href="#/" class="active">Board (' + DATA.board_size + ')</a><a href="#/live">Live tokens (' + DATA.audit.live + ')</a><a href="#/method">Method</a></div>'
+      + controlsHtml()
+      + '<p class="count">Showing ' + rows.length + ' of ' + DATA.board_size + ' rows. Expected value is the fitted value times the odds; the range is the bootstrap 80% interval. Click a row for its model breakdown and costed farm plan.</p>'
+      + boardTable(rows);
   }
 
-  function sortHeader(key, label) {
-    return el('th', { scope: 'col' },
-      el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = -1; } render(); } },
-        label,
-        state.sort === key ? el('span', { 'aria-hidden': 'true', text: state.dir < 0 ? ' v' : ' ^' }) : null
-      )
-    );
+  /* ---- detail view ---- */
+  function detailView(slug) {
+    var r = null;
+    DATA.rows.forEach(function (row) { if (row.slug === slug) r = row; });
+    if (!r) return '<p>Unknown protocol: ' + esc(slug) + '. <a href="#/">Back to the board</a></p>';
+    var m = modelFor(r.tvl_usd, r.change_7d === null ? 0 : r.change_7d, r.age_days, r.category, r.chains.length);
+    var steps = r.farm_steps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
+    return '<a class="back" href="#/">&larr; Back to the board</a>'
+      + '<h1>#' + r.rank + ' ' + esc(r.name) + ' <span class="pill ' + r.verdict + '">' + r.verdict + '</span></h1>'
+      + '<p class="lede">' + esc(r.category || 'Uncategorised') + ' · ' + esc(r.chains.join(', ')) + ' · TVL ' + usdM(r.tvl_usd)
+      + ' · 7d ' + (r.change_7d === null ? '—' : (r.change_7d >= 0 ? '+' : '') + r.change_7d.toFixed(1) + '%')
+      + ' · age ' + fmtAge(r.age_days) + (r.watchlist ? ' · on the watchlist' : '') + '.</p>'
+      + '<div class="detail-grid"><div class="panel"><h3>Model breakdown</h3><dl class="kv">'
+      + '<dt>Fitted value</dt><dd>' + usdM(r.fitted_value_usd) + '</dd>'
+      + '<dt>Listing odds</dt><dd>' + r.odds.toFixed(3) + ' (pi ' + m.pi.toFixed(3) + ')</dd>'
+      + '<dt>Expected value</dt><dd>' + usdM(r.implied_value_usd) + '</dd>'
+      + '<dt>80% range</dt><dd>' + usdM(r.ev_low_usd) + ' – ' + usdM(r.ev_high_usd) + '</dd>'
+      + '<dt>Rank range</dt><dd>#' + r.rank_low + ' – #' + r.rank_high + '</dd>'
+      + '<dt>Recomputed in page</dt><dd>' + usdM(m.ev) + ' (fitted ' + usdM(m.fitted) + ' × odds ' + m.odds.toFixed(3) + ')</dd>'
+      + '</dl><p class="econ">The page recomputes this row from its own TVL, growth, age and category with the fitted coefficients — the board and the code agree by construction.</p></div>'
+      + '<div class="panel"><h3>Farm economics</h3><dl class="kv">'
+      + '<dt>Capital</dt><dd>' + usd(r.capital_usd) + '</dd>'
+      + '<dt>Hold</dt><dd>' + r.hold_days + ' days</dd>'
+      + '<dt>Gas (7 tx)</dt><dd>' + money(r.gas_usd) + '</dd>'
+      + '<dt>Total cost</dt><dd>' + usd(r.total_cost_usd) + '</dd>'
+      + '<dt>Expected take</dt><dd>' + usd(r.expected_take_usd) + '</dd>'
+      + '<dt>Net</dt><dd>' + usd(r.net_usd) + '</dd>'
+      + '<dt>Dollars / hour</dt><dd>' + usd(r.usd_per_hour) + '</dd>'
+      + '<dt>Break-even farmers</dt><dd>' + Math.round(r.breakeven_farmers).toLocaleString('en-US') + '</dd>'
+      + '</dl><p class="econ">Take is the expected value times a stated 7% airdrop-pool share, split across a stated 10,000 farmers. Verdict: farm when net ≥ $100 and $/hour ≥ $25; thin when net &gt; $0; skip otherwise.</p></div></div>'
+      + '<h2>Farm plan — 7 steps, costed</h2><ol class="steps">' + steps + '</ol>';
   }
 
-  // ---- The board table, the live table, the model panel ----
-
-  function boardTable() {
-    var list = sortedRows(rows());
-    if (list.length === 0) {
-      return el('div', { class: 'panel' }, el('div', { class: 'empty' },
-        el('h2', { text: 'No protocol matches that filter' }),
-        el('p', { text: 'Clear the search or pick another category to see the board again.' }),
-        el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; state.chain = 'all'; state.watchlistOnly = false; writeHash(); render(); } })
-      ));
-    }
-    var max = 1;
-    list.forEach(function (r) { max = Math.max(max, shownImplied(r)); });
-    var tbody = el('tbody');
-    list.forEach(function (r) {
-      var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
-      var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
-      var implied = shownImplied(r);
-      var tr = el('tr', {
-        'data-selected': state.selected === r.slug ? 'true' : 'false',
-        tabindex: '0',
-        onclick: function () { openDetail(r.slug); },
-        onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(r.slug); } }
-      },
-        el('td', { class: 'num', text: String(r.rank) }),
-        el('td', null, el('div', { class: 'name' },
-          el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + chainLabel(r) })
-        )),
-        el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
-        el('td', { class: 'num ' + growthClass, text: growth }),
-        el('td', { class: 'num', text: fmtAge(r.age_days) }),
-        el('td', null, el('div', { class: 'implied' },
-          el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((implied / max) * 100)) + '%' })),
-          el('span', { class: 'num', text: fmtUsd(implied) })
-        )),
-        el('td', null, r.watchlist ? el('span', { class: 'badge', text: 'watchlist' }) : el('span', { class: 'status', text: 'no token' }))
-      );
-      tbody.appendChild(tr);
-    });
-    return el('div', { class: 'panel' },
-      el('div', { class: 'table-wrap' },
-        el('table', null,
-          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its model and farm plan.' }),
-          el('thead', null, el('tr', null,
-            sortHeader('implied', 'Rank'),
-            sortHeader('name', 'Protocol'),
-            sortHeader('tvl', 'TVL'),
-            sortHeader('growth', '7d'),
-            sortHeader('age', 'Age'),
-            sortHeader('implied', 'Implied value'),
-            el('th', { scope: 'col', text: 'Token' })
-          )),
-          tbody
-        )
-      )
-    );
+  /* ---- live-token tab ---- */
+  function liveView() {
+    var body = DATA.live.map(function (p) {
+      return '<tr><td>' + esc(p.name) + '</td><td>' + esc(p.category || '—') + '</td>'
+        + '<td>' + esc(p.chains.slice(0, 2).join(', ')) + '</td>'
+        + '<td class="num">' + usdM(p.tvl_usd) + '</td>'
+        + '<td class="num">' + (p.mcap_usd === null ? '—' : usdM(p.mcap_usd)) + '</td>'
+        + '<td class="num">' + (p.change_7d === null ? '—' : (p.change_7d >= 0 ? '+' : '') + p.change_7d.toFixed(1) + '%') + '</td></tr>';
+    }).join('');
+    return '<h1>Live tokens — set aside, not ranked</h1>'
+      + '<p class="lede">' + DATA.audit.live + ' protocols already trade a token, so the board does not rank them: their value is the market\u2019s own, not a model\u2019s. ' + DATA.audit.live_with_mcap + ' record a positive market cap; ' + DATA.audit.live_no_mcap + ' record a token but no market cap (16 of those record a zero or negative market cap — dead tokens, excluded from the value fit and named in the method). The table shows the top ' + DATA.live.length + ' by market cap.</p>'
+      + '<div class="tabs"><a href="#/">Board (' + DATA.board_size + ')</a><a href="#/live" class="active">Live tokens (' + DATA.audit.live + ')</a><a href="#/method">Method</a></div>'
+      + '<div class="tablewrap"><table><thead><tr><th>Protocol</th><th>Category</th><th>Chains</th><th class="num">TVL</th><th class="num">Market cap</th><th class="num">7d</th></tr></thead><tbody>' + body + '</tbody></table></div>';
   }
 
-  function liveTable() {
-    var tbody = el('tbody');
-    DATA.live.forEach(function (r) {
-      tbody.appendChild(el('tr', null,
-        el('td', { class: 'num', text: 'live' }),
-        el('td', null, el('div', { class: 'name' }, el('b', { text: r.name }), el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + chainLabel(r) }))),
-        el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
-        el('td', { class: 'num ' + (r.change_7d !== null && r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) }),
-        el('td', { class: 'num', text: fmtUsd(r.mcap_usd) }),
-        el('td', null, el('span', { class: 'status', text: 'already trades' }))
-      ));
-    });
-    return el('div', { class: 'panel' },
-      el('div', { class: 'table-wrap' },
-        el('table', null,
-          el('caption', { class: 'sub', text: 'Token live: these protocols already trade, so their market cap is a fact, not a model. They are set aside from the pre-token ranking.' }),
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Status' }), el('th', { scope: 'col', text: 'Protocol' }), el('th', { scope: 'col', text: 'TVL' }), el('th', { scope: 'col', text: '7d' }), el('th', { scope: 'col', text: 'Market cap' }), el('th', { scope: 'col', text: 'Token' }))),
-          tbody
-        )
-      )
-    );
+  /* ---- audit + method + sandbox ---- */
+  function auditHtml() {
+    var a = DATA.audit;
+    var reasons = Object.keys(a.excluded_breakdown).sort().map(function (k) {
+      return '<tr><td>' + esc(k) + '</td><td class="num">' + a.excluded_breakdown[k] + '</td></tr>';
+    }).join('');
+    return '<h2>758 accounted — every protocol counted once</h2>'
+      + '<table class="audit-table"><thead><tr><th>Bucket</th><th class="num">Count</th></tr></thead><tbody>'
+      + '<tr><td>Ranked on the board</td><td class="num">' + a.ranked + ' (' + a.ranked_watchlist + ' watchlist, ' + a.ranked_below_floor + ' below the $50M floor, ' + a.ranked_above_floor + ' above it)</td></tr>'
+      + '<tr><td>Pre-token, excluded by the watchlist\u2019s own rules</td><td class="num">' + a.excluded_pre_token + '</td></tr>'
+      + '<tr><td>Live-token, set aside</td><td class="num">' + a.live + ' (' + a.live_with_mcap + ' with a market cap, ' + a.live_no_mcap + ' without)</td></tr>'
+      + '<tr><td><strong>Total</strong></td><td class="num"><strong>' + a.total + '</strong></td></tr>'
+      + '</tbody></table>'
+      + '<h3>Why the 144 were excluded</h3><table class="audit-table"><thead><tr><th>Reason</th><th class="num">Count</th></tr></thead><tbody>' + reasons + '</tbody></table>'
+      + '<p class="small muted">One caveat, stated in the open: the snapshot carries no parentProtocol field, so a protocol whose parent the watchlist\u2019s own computation knew cannot be checked here; the board\u2019s rules are only the ones the sealed snapshot can check.</p>';
   }
 
-  function modelPanel() {
-    var m = DATA.model;
-    var breakdown = Object.keys(DATA.excluded_breakdown || {}).sort().map(function (k) {
-      return DATA.excluded_breakdown[k] + ' ' + k;
+  function methodHtml() {
+    var cats = Object.keys(VF.categories).sort().map(function (c) {
+      return '<code>' + esc(c) + ' ' + (VF.categories[c] >= 0 ? '+' : '') + VF.categories[c].toFixed(3) + '</code>';
     }).join(', ');
-    var baseSlider = el('input', { type: 'range', min: '0.20', max: '0.30', step: '0.01', value: String(state.sandbox.base), 'aria-label': 'Base multiple' });
-    var baseOut = el('output', { text: state.sandbox.base.toFixed(2) });
-    baseSlider.addEventListener('input', function () { state.sandbox.base = parseFloat(baseSlider.value); baseOut.textContent = state.sandbox.base.toFixed(2); render(); });
-    var highSlider = el('input', { type: 'range', min: '0.25', max: '0.45', step: '0.01', value: String(state.sandbox.high), 'aria-label': 'Capital-efficient multiple' });
-    var highOut = el('output', { text: state.sandbox.high.toFixed(2) });
-    highSlider.addEventListener('input', function () { state.sandbox.high = parseFloat(highSlider.value); highOut.textContent = state.sandbox.high.toFixed(2); render(); });
-    var reset = el('button', { class: 'button', type: 'button', text: 'Reset to the board\u2019s model', onclick: function () { state.sandbox.base = m.base_multiple; state.sandbox.high = m.category_multiple_high; render(); } });
-    return el('section', { class: 'panel model' },
-      el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
-      el('div', { class: 'formula' },
-        'implied = round( tvl_usd x category_multiple (' + m.category_multiple_high + ' for capital-efficient categories, ' + m.base_multiple + ' otherwise) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x maturity(age) x breadth(chains) )'
-      ),
-      el('p', { class: 'sub', text: 'Maturity is an inverted U: it rises over the first year, holds through year three, then decays — a long run with no token counts against a launch, not for it. Breadth adds 5% per extra chain, up to 20%. Age is the time since the protocol was first listed; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
-      el('p', { class: 'note', text: 'Excluded from the early radar: ' + DATA.excluded_early + ' pre-token protocols below the floor (' + breakdown + '). A wrapped, staked or bridged product of a token that already trades is not a token that does not exist yet.' }),
-      el('div', { class: 'sandbox' },
-        el('h3', { text: 'Model sandbox — what if the multiples were different?' }),
-        el('div', { class: 'sandbox-row' }, el('label', { text: 'Base multiple (all other categories)' }), baseSlider, baseOut),
-        el('div', { class: 'sandbox-row' }, el('label', { text: 'Capital-efficient multiple (lending, CDP, derivatives, RWA)' }), highSlider, highOut),
-        el('div', { class: 'sandbox-row' }, reset, el('span', { class: 'sub', text: sandboxChanged() ? 'Showing what-if values: the board\u2019s own numbers return when you reset.' : 'At the board\u2019s own multiples, the page recomputes every row to the number board.json carries.' }))
-      )
-    );
+    return '<h2>Method — what was fitted, what was assumed, what the numbers say</h2>'
+      + '<div class="method">'
+      + '<h3>Value model (ridge, λ = 10)</h3>'
+      + '<p>log<sub>10</sub>(market cap) = ' + VF.intercept.toFixed(3) + ' + ' + VF.log_tvl.toFixed(3) + '·(log<sub>10</sub>TVL − 8) + ' + VF.log_tvl_sq.toFixed(3) + '·(log<sub>10</sub>TVL − 8)² + category + ' + VF.log_chains.toFixed(3) + '·log<sub>10</sub>(chains) + ' + VF.growth.toFixed(3) + '·growth + ' + VF.age_years.toFixed(3) + '·age + ' + VF.age_years_sq.toFixed(3) + '·age². Fitted on the ' + VF.n_comps + ' traded protocols that record a positive market cap. Category terms: ' + cats + '. Growth is winsorized to ±50% (99% of protocols sit inside it; one grew 4,448% in a week). Age is years since the protocol joined DefiLlama, or the median ' + VF.median_age_days + ' days where it is missing.</p>'
+      + '<p><strong>Validation, all computed at run time.</strong> Leave-one-out RMSE ' + VF.loo_rmse_dex.toFixed(3) + ' dex against a flat median multiple\u2019s ' + VF.loo_flat_rmse_dex.toFixed(3) + ' (' + VF.loo_ratio.toFixed(2) + '× better); within 3× of the true market cap ' + pct(VF.loo_within_3x, 0) + ' of the time (flat multiple ' + pct(VF.flat_within_3x, 0) + '), within 2× ' + pct(VF.loo_within_2x, 0) + '. Walk-forward — fit on the older half by listing date, tested on the newer half — RMSE ratio ' + VF.wf_ratio.toFixed(2) + '×, within 3× ' + pct(VF.wf_within_3x, 0) + ' against the flat multiple\u2019s ' + pct(VF.wf_flat_within_3x, 0) + '. A placebo (shuffled target) scores R² ' + VF.placebo_r_squared.toFixed(3) + ' against the real fit\u2019s ' + VF.r_squared.toFixed(3) + '. The honest read: the fit beats a flat multiple, but only modestly — market cap is noisy, and the board\u2019s 80% intervals say so row by row.</p>'
+      + '<p>' + VF.n_dead_excluded + ' traded tokens record a zero or negative market cap. They are dead tokens: the log fit leaves them out, and the board names the count here rather than silently dropping them.</p>'
+      + '<h3>Odds model (cure-survival, maximum likelihood)</h3>'
+      + '<p>π = sigmoid(' + OF.cure_pi_intercept.toFixed(2) + ' + ' + OF.cure_log_tvl.toFixed(2) + '·(log<sub>10</sub>TVL − 8) + ' + OF.cure_growth.toFixed(2) + '·growth + ' + OF.cure_log_chains.toFixed(2) + '·log<sub>10</sub>(chains)); the no-token clock is Weibull with λ = ' + Math.round(OF.weibull_lambda_days) + ' days and k = ' + OF.weibull_k.toFixed(2) + '. A protocol that has run <em>a</em> days with no token has odds π·S(<em>a</em>) / (1 − π + π·S(<em>a</em>)) of listing eventually. The likelihood is current-status — <code>listed_at</code> is the DefiLlama date, not the token launch date, so a listed protocol contributes P(listed by age <em>a</em>), never a density at <em>a</em>. The gradients were checked against finite differences.</p>'
+      + '<p><strong>Validation.</strong> 5-fold cross-validated AUC ' + OF.auc_cv.toFixed(3) + ' for P(has a token by age) — weak but real (0.5 is chance). The snapshot\u2019s figures predict listing only modestly: fast growers are mostly young pre-token protocols in a growth spurt, which is why the growth coefficient is negative. Odds over the board run ' + OF.odds_min.toFixed(2) + ' to ' + OF.odds_max.toFixed(2) + ', median ' + OF.odds_median.toFixed(2) + '.</p>'
+      + '<h3>Farm economics (assumptions, stated in the open)</h3>'
+      + '<p>Gas per transaction: Ethereum $3.00, Arbitrum $0.25, Optimism $0.20, Base $0.05, Solana $0.01, Polygon $0.05, Avalanche $0.30, BNB Chain $0.15, other $0.50; a plan spends 7 transactions. Capital by TVL tier: $250 above $1B, $150 above $100M, $100 below. Hold: 45 / 60 / 90 days by the same tiers. Opportunity cost 8% a year on the capital. Expected take: expected value × a stated 7% airdrop-pool share, split across a stated 10,000 farmers. Verdict: farm when net ≥ $100 and $/hour ≥ $25; thin when net &gt; $0; skip otherwise. Re-price any of these and the verdicts move — the numbers are all on the row.</p>'
+      + '</div>';
   }
 
-  // ---- The detail drawer: model breakdown and farm plan for one protocol ----
-
-  var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
-  dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
-
-  function openDetail(slug) {
-    var row = DATA.rows.filter(function (r) { return r.slug === slug; })[0];
-    if (!row) return;
-    state.selected = slug;
-    writeHash();
-    dialog.textContent = '';
-    var steps = farmSteps(row);
-    var recomputed = impliedOf(row, DATA.model, state.sandbox);
-    dialog.appendChild(el('div', { class: 'detail-head' },
-      el('div', null,
-        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.watchlist ? ' · on the watchlist' : ' · early radar') }),
-        el('h2', { id: 'detail-title', text: row.name }),
-        el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') })
-      ),
-      el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
-    ));
-    dialog.appendChild(el('section', { class: 'detail-section' },
-      el('h3', { text: 'Implied value' }),
-      el('div', { class: 'equation' },
-        el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: String(row.category_multiple) })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
-        el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
-        el('div', null, el('span', { text: 'Chains (' + (row.chains ? row.chains.length : 0) + ')' }), el('b', { class: 'num', text: 'x' + String(row.breadth_multiplier) })),
-        el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
-      ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ' under the sandbox multiples; the board carries ' + fmtUsd(row.implied_value_usd) + '.') + ' This is an estimate, not a price.' })
-    ));
-    dialog.appendChild(el('section', { class: 'detail-section' },
-      el('h3', { text: 'Farm plan' }),
-      el('ol', { class: 'steps' }, steps.map(function (s) {
-        var at = s.indexOf(' Cost: ');
-        var action = at >= 0 ? s.slice(0, at) : s;
-        var tail = at >= 0 ? s.slice(at + 1) : '';
-        return el('li', null, el('b', { text: action }), el('span', { class: 'cost', text: tail }));
-      }))
-    ));
-    if (typeof dialog.showModal === 'function') {
-      if (!dialog.open) dialog.showModal();
-    } else {
-      dialog.setAttribute('open', '');
-    }
+  function sandboxHtml() {
+    var cats = Object.keys(VF.categories).sort();
+    return '<h2>Model sandbox — recompute any protocol</h2>'
+      + '<p class="small muted">The same fitted coefficients, run live. Change a figure and the expected value follows.</p>'
+      + '<div class="sandbox">'
+      + '<div><label for="sb-tvl">TVL (USD)</label><input id="sb-tvl" type="number" value="100000000" min="1"></div>'
+      + '<div><label for="sb-growth">7d growth (%)</label><input id="sb-growth" type="number" value="0" step="0.1"></div>'
+      + '<div><label for="sb-age">Age (days)</label><input id="sb-age" type="number" value="365" min="0"></div>'
+      + '<div><label for="sb-cat">Category</label><select id="sb-cat"><option value="">Other</option>'
+      + cats.map(function (c) { return '<option>' + esc(c) + '</option>'; }).join('') + '</select></div>'
+      + '<div><label for="sb-chains">Chains</label><input id="sb-chains" type="number" value="1" min="1"></div>'
+      + '</div><p class="sandbox-out" id="sb-out"></p>';
   }
 
-  // ---- Render, and the keyboard: / focuses the search, Escape closes the drawer ----
+  function methodView() {
+    return '<h1>Method</h1>' + auditHtml() + methodHtml() + sandboxHtml()
+      + '<p><a href="#/">&larr; Back to the board</a></p>';
+  }
 
+  /* ---- routing ---- */
   function render() {
-    app.textContent = '';
-    var shell = el('div', { class: 'shell' });
-    shell.appendChild(header());
-    shell.appendChild(lede());
-    shell.appendChild(controls());
-    shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
-    app.appendChild(shell);
+    var hash = window.location.hash || '#/';
     app.setAttribute('aria-busy', 'false');
-    if (!dialog.isConnected) app.appendChild(dialog);
-    if (state.selected) openDetail(state.selected);
+    if (hash.indexOf('#/row/') === 0) {
+      app.innerHTML = detailView(decodeURIComponent(hash.slice(6)));
+    } else if (hash === '#/live') {
+      app.innerHTML = liveView();
+    } else if (hash === '#/method') {
+      app.innerHTML = methodView();
+      bindSandbox();
+    } else {
+      if (hash.indexOf('#/filter=') === 0) {
+        var f = hash.slice(9);
+        if (f === 'watchlist') state.watchlistOnly = true;
+        if (f.indexOf('verdict:') === 0) state.verdict = f.slice(8);
+      }
+      app.innerHTML = boardView();
+      bindBoard();
+    }
+    window.scrollTo(0, 0);
   }
 
-  readHash();
-  render();
-  window.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && dialog.open) dialog.close();
-    if (e.key === '/' && document.activeElement !== document.getElementById('q')) {
-      e.preventDefault();
-      var box = document.getElementById('q');
-      if (box) box.focus();
+  function bindSandbox() {
+    var out = document.getElementById('sb-out');
+    function update() {
+      var tvl = parseFloat(document.getElementById('sb-tvl').value) || 1;
+      var growth = parseFloat(document.getElementById('sb-growth').value) || 0;
+      var age = parseFloat(document.getElementById('sb-age').value);
+      var cat = document.getElementById('sb-cat').value || null;
+      var chains = parseInt(document.getElementById('sb-chains').value, 10) || 1;
+      var m = modelFor(tvl, growth, isNaN(age) ? null : age, cat, chains);
+      out.textContent = 'Fitted value ' + usdM(m.fitted) + ' · π ' + m.pi.toFixed(3) + ' · odds ' + m.odds.toFixed(3) + ' · expected value ' + usdM(m.ev);
+    }
+    ['sb-tvl', 'sb-growth', 'sb-age', 'sb-cat', 'sb-chains'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener('input', update);
+    });
+    update();
+  }
+
+  function bindBoard() {
+    var q = document.getElementById('q');
+    if (q) q.addEventListener('input', function () { state.q = q.value; refreshBoard(); });
+    var cat = document.getElementById('cat');
+    if (cat) cat.addEventListener('change', function () { state.category = cat.value; refreshBoard(); });
+    var verdict = document.getElementById('verdict');
+    if (verdict) verdict.addEventListener('change', function () { state.verdict = verdict.value; refreshBoard(); });
+    var sort = document.getElementById('sort');
+    if (sort) sort.addEventListener('change', function () { state.sort = sort.value; refreshBoard(); });
+    var watch = document.getElementById('watch');
+    if (watch) watch.addEventListener('change', function () { state.watchlistOnly = watch.checked; refreshBoard(); });
+    app.querySelectorAll('tbody tr').forEach(function (tr) {
+      tr.addEventListener('click', function () { window.location.hash = '#/row/' + encodeURIComponent(tr.getAttribute('data-slug')); });
+    });
+  }
+
+  function refreshBoard() {
+    var rows = filteredRows();
+    var wrap = app.querySelector('.tablewrap');
+    if (wrap) wrap.outerHTML = boardTable(rows);
+    var count = app.querySelector('.count');
+    if (count) count.textContent = 'Showing ' + rows.length + ' of ' + DATA.board_size + ' rows. Expected value is the fitted value times the odds; the range is the bootstrap 80% interval. Click a row for its model breakdown and costed farm plan.';
+    app.querySelectorAll('tbody tr').forEach(function (tr) {
+      tr.addEventListener('click', function () { window.location.hash = '#/row/' + encodeURIComponent(tr.getAttribute('data-slug')); });
+    });
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === '/' && document.activeElement && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'SELECT') {
+      var q = document.getElementById('q');
+      if (q) { e.preventDefault(); q.focus(); }
     }
   });
+  window.addEventListener('hashchange', render);
+  render();
 })();

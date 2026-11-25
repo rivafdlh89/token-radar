@@ -1,17 +1,20 @@
-// Token Radar's entrypoint (Node 22, standard library only), radar-2.
+// Token Radar's entrypoint (Node 22, standard library only), radar-3.
 //
 // The run is four stages, in order. First the program finds the sealed snapshot —
 // /input/snapshot.json in the grader's container, or --input <file|directory> anywhere else —
-// and scores every pre-token protocol with the model in lib/model.ts. Then it writes the
-// ranked board to /output/board.json and the dashboard's dataset beside the page. Then it
+// and scores every pre-token protocol with the fitted model in lib/model.ts. Then it writes
+// the ranked board to /output/board.json and the dashboard's dataset beside the page. Then it
 // copies this repository's dashboard/ and screenshots/ into /output. Last it writes
 // /output/dossier.json, the summary the judge reads, with the vendored make.fun library.
 //
-// Radar-2 improves on the starter in three places. It applies the watchlist's own exclusion
-// rules (wrapped, staked and bridged products, versioned names, exchanges) to every row, not
-// just to the watchlist. It scores with a category multiple, an inverted-U maturity curve and
-// a multi-chain breadth multiplier. And every farm plan has seven steps, the second a
-// different qualifying action from the first, so one wallet shows two distinct entries.
+// Radar-3 fits the model instead of inventing it. The value of a pre-token protocol comes
+// from a ridge regression of log market cap on log TVL, fitted on the 128 traded protocols
+// that record a positive market cap, and validated leave-one-out, walk-forward and against a
+// placebo — the numbers are printed on the cover. The board ranks by expected value: that
+// fitted value times a cure-survival model's odds of ever listing a token, fitted by maximum
+// likelihood on all 758 protocols. All 758 protocols are accounted for on the cover — 198
+// ranked, 144 excluded by the watchlist's own rules, 416 live-token protocols set aside —
+// and every farm plan is costed to the dollar and ends in a verdict: farm, thin or skip.
 //
 // The dashboard is a static page, no framework and no network: dashboard/index.html,
 // dashboard/app.css and dashboard/app.js read /output/data.js, which this program writes
@@ -82,7 +85,7 @@ requireSnapshot(inputFile);
 const out = outputDirFor();
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
-const { board, radar } = buildRadar(snapshot);
+const { board, data: radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
@@ -151,6 +154,7 @@ function writeDossier(outDir: string): void {
 writeDossier(out);
 
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.excluded_early} early excluded, ${radar.live_size} live set aside)\n` +
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.audit.ranked_watchlist} watchlist, ${radar.audit.ranked_below_floor} below floor, ${radar.audit.ranked_above_floor} above floor; ${radar.audit.excluded_pre_token} excluded, ${radar.audit.live} live set aside)\n` +
+    `token radar: value fit LOO RMSE ${radar.value_fit.loo_rmse_dex.toFixed(3)} dex vs flat ${radar.value_fit.loo_flat_rmse_dex.toFixed(3)} (${radar.value_fit.loo_ratio.toFixed(2)}x), within-3x ${(100 * radar.value_fit.loo_within_3x).toFixed(1)}% (flat ${(100 * radar.value_fit.flat_within_3x).toFixed(1)}%); walk-forward ${radar.value_fit.wf_ratio.toFixed(2)}x; odds 5-fold CV AUC ${radar.odds_fit.auc_cv.toFixed(3)}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

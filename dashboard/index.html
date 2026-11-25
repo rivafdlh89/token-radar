@@ -1,15 +1,17 @@
 <!doctype html>
-<!-- Token Radar's page shell, radar-2. The board itself is rendered into #board by
+<!-- Token Radar's page shell, radar-3. The board is rendered into #board by
      dashboard/app.js from window.RADAR, the dataset main.ts writes beside this page as
-     data.js. No framework, no fetch and no network: every byte the page shows is local. -->
+     data.js. No framework, no fetch and no network: every byte the page shows is local.
+     Hash routes: #/ is the board, #/row/<slug> is one protocol's detail view, and
+     #/filter=<key> is a filtered board (watchlist, or verdict:farm). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light">
-<meta name="description" content="Token Radar ranks pre-token protocols by implied launch value, with a farm plan for each — a static dashboard with no network.">
+<meta name="description" content="Token Radar ranks pre-token protocols by expected launch value — a fitted value model times fitted listing odds — with a costed farm plan for each.">
 <meta name="theme-color" content="#f2f5f3">
-<title>Token Radar: pre-token protocols ranked by implied value</title>
+<title>Token Radar: pre-token protocols ranked by expected value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
